@@ -1,0 +1,31 @@
+[project]
+name = "crypto-engine"
+version = "0.1.0"
+description = "Veille — moteur d analyse technique (signaux BUY/SELL), sans accès aux clés API"
+requires-python = ">=3.12"
+dependencies = [
+    "ccxt>=4.5.90",
+    "fastapi>=0.161.1",
+    "pandas>=3.1.0",
+    "pydantic-settings>=2.16.1",
+    "redis>=8.1.0",
+    "ta-lib>=0.8.2",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "ruff>=0.17.2",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
