@@ -71,3 +71,30 @@ Moteur réel (top 20 de Binance, bougies 1h réelles) + Redis + API complète (P
 | Liste d'exclusion (`EXCLUDED_SYMBOLS`) | Voir E2 : écarter les jetons exotiques sans fixer toute la liste. |
 | Plusieurs horizons (15 m, 4 h) | Un `id` par horizon est déjà prévu (`1h` dans l'identifiant). |
 | Indicateurs de volume | Le volume n'entre pas encore dans le score. |
+
+---
+
+## Étape 14 — Backtest de la stratégie
+
+Résultats, méthode, limites et pistes : `docs/BACKTEST.md`. Résumé : **la stratégie actuelle perd de l'argent et ne doit pas passer en LIVE** (−19,8 % sur 12 mois, et moins bien qu'une détention à exposition égale, même sans frais).
+
+### E14. Le backtest rejoue la stratégie de production, il ne la recopie pas
+Le `Scanner` réel est branché sur un marché simulé (`SimMarket`, qui ne montre que les bougies déjà fermées) et sur un « stream » qui collecte les signaux au lieu de les envoyer à Redis. Les signaux passent donc par la vraie validation (`Signal`). Si la stratégie de production change, le backtest la suit sans qu'on y pense, et il ne peut pas valider autre chose que ce qui tourne.
+
+### E15. Exécution réaliste : ouverture de la bougie suivante, frais, glissement
+Un ordre décidé à la clôture part à l'**ouverture de la bougie d'après** (jamais au prix qui l'a déclenché, ce qui serait une triche). Frais de 0,1 % et glissement de 0,05 % par ordre. Stop-loss et take-profit sont contrôlés sur chaque bougie ; si les deux sont touchés dans la même, le stop-loss l'emporte (on ne sait pas lequel est venu en premier) ; si la bougie ouvre déjà au-delà du niveau, la sortie se fait à l'ouverture (un trou de prix n'est pas gommé).
+
+### E16. Mêmes règles que l'API pour le portefeuille
+5 % du capital par position au maximum, achat proportionnel au score, vente de toute la position, stop-loss 3 % et take-profit 6 % (les valeurs par défaut de l'API). Le portefeuille simulé n'invente pas de règle : un résultat obtenu avec d'autres règles que la production n'aurait aucun sens.
+
+### E17. Deux périodes séparées, et aucun réglage pendant cette étape
+Optimisation (8 mois) et validation (4 mois), simulées séparément. **Rien n'a été réglé** : les résultats sont ceux de la première exécution. La séparation sert aux étapes suivantes : si l'on règle quelque chose, ce sera sur la première période et on le jugera sur la seconde. Ici les deux périodes sont de régimes opposés (marché −56 % puis +30 %), ce qui limite la valeur de la validation (voir BACKTEST.md).
+
+### E18. Garde-fou contre le regard sur le futur
+Un test réécrit tout l'avenir (krach de 80 % après une bougie donnée) et vérifie que l'équité et les opérations antérieures sont strictement identiques. Un autre vérifie que le marché simulé ne montre que les bougies d'indice inférieur ou égal à l'instant simulé, qu'aucun ordre ne part pendant la chauffe, et que le dernier signal (sans bougie suivante) n'est jamais exécuté.
+
+### E19. Diagnostic sans frais ni glissement
+Pour savoir si la perte vient du coût des échanges ou du signal lui-même, la même simulation est rejouée avec `--fee-rate 0 --slippage-rate 0` sur la même fenêtre (`--until-ms` la fige). Résultat : −11,1 % sans frais, contre −6,9 % pour la détention à exposition égale : **le signal brut n'a pas d'avantage**, les frais aggravent (−8,7 points).
+
+### E20. Limites et suites
+Biais des survivants, une seule fenêtre de 12 mois, un seul pas de temps, glissement fixe (voir BACKTEST.md). Suites à décider ensemble, dans cet ordre : plus d'historique (24 à 36 mois), moins trader (bougies plus longues, carence), stops adaptés à la volatilité, filtre de régime ; puis l'essai testnet de l'API. Aucun passage en LIVE tant qu'un backtest positif après frais, sur une validation jamais utilisée pour régler, n'existe.

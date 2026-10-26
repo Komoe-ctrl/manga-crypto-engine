@@ -67,3 +67,7 @@ Chaque message du stream porte sa raison. Exemple réel :
 ## Limites
 
 Pas de backtest : la stratégie n'a pas été éprouvée sur l'historique (E12). Une seule instance conseillée. Le moteur ne sait pas ce que l'API a fait de ses signaux.
+
+## Backtest
+
+`uv run python -m app.backtest` rejoue la stratégie sur 12 mois d'historique Binance public (périodes d'optimisation et de validation séparées). Résultats et mode d'emploi détaillé : `docs/BACKTEST.md`. **À lire avant tout passage en LIVE** : la stratégie actuelle y perd de l'argent.
