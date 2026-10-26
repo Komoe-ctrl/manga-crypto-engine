@@ -35,6 +35,8 @@ class Indicators:
     volatility_pct: float
     #: « UP » / « DOWN » si l'EMA 20 a croisé l'EMA 50 dans les dernières bougies, sinon None.
     recent_cross: str | None
+    #: Amplitude moyenne d'une bougie (ATR sur 14), en % du prix : mesure de la volatilité.
+    atr_pct: float = 0.0
 
     def as_dict(self) -> dict[str, float | str | None]:
         """Valeurs arrondies, pour le champ `indicators` du signal."""
@@ -47,6 +49,7 @@ class Indicators:
             "bb_pct": round(self.bb_pct, 3),
             "volatility_pct": round(self.volatility_pct, 3),
             "recent_cross": self.recent_cross,
+            "atr_pct": round(self.atr_pct, 4),
         }
 
 
@@ -65,6 +68,9 @@ def compute_indicators(candles: pd.DataFrame) -> Indicators:
     rsi = talib.RSI(close, timeperiod=14)
     _, _, macd_hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
     upper, _, lower = talib.BBANDS(close, timeperiod=20, nbdevup=2, nbdevdn=2)
+    high = candles["high"].to_numpy(dtype=np.float64)
+    low = candles["low"].to_numpy(dtype=np.float64)
+    atr = talib.ATR(high, low, close, timeperiod=14)
 
     last = {
         "ema20": ema20[-1],
@@ -74,6 +80,7 @@ def compute_indicators(candles: pd.DataFrame) -> Indicators:
         "macd_hist_prev": macd_hist[-2],
         "upper": upper[-1],
         "lower": lower[-1],
+        "atr": atr[-1],
     }
     if not all(np.isfinite(v) for v in last.values()):
         raise InsufficientDataError("indicateur non calculable")
@@ -95,7 +102,27 @@ def compute_indicators(candles: pd.DataFrame) -> Indicators:
         bb_pct=min(max(bb_pct, -0.5), 1.5),
         volatility_pct=volatility_pct,
         recent_cross=_recent_cross(ema20, ema50),
+        atr_pct=float(last["atr"] / close[-1] * 100),
     )
+
+
+# EMA 200 : demande plus de 200 bougies pour être fiable.
+REGIME_FAST = 50
+REGIME_SLOW = 200
+
+
+def trend_is_up(candles: pd.DataFrame) -> bool:
+    """Tendance haussière d'un marché : EMA 50 au-dessus de l'EMA 200 (bougies fermées)."""
+    if len(candles) < REGIME_SLOW + 1:
+        raise InsufficientDataError(f"{len(candles)} bougies, {REGIME_SLOW + 1} requises")
+    close = candles["close"].to_numpy(dtype=np.float64)
+    if not np.isfinite(close[-REGIME_SLOW:]).all() or (close[-REGIME_SLOW:] <= 0).any():
+        raise InsufficientDataError("prix manquants ou invalides")
+    fast = talib.EMA(close, timeperiod=REGIME_FAST)[-1]
+    slow = talib.EMA(close, timeperiod=REGIME_SLOW)[-1]
+    if not (np.isfinite(fast) and np.isfinite(slow)):
+        raise InsufficientDataError("indicateur non calculable")
+    return bool(fast > slow)
 
 
 def _recent_cross(ema20: np.ndarray, ema50: np.ndarray) -> str | None:
