@@ -98,3 +98,31 @@ Pour savoir si la perte vient du coût des échanges ou du signal lui-même, la 
 
 ### E20. Limites et suites
 Biais des survivants, une seule fenêtre de 12 mois, un seul pas de temps, glissement fixe (voir BACKTEST.md). Suites à décider ensemble, dans cet ordre : plus d'historique (24 à 36 mois), moins trader (bougies plus longues, carence), stops adaptés à la volatilité, filtre de régime ; puis l'essai testnet de l'API. Aucun passage en LIVE tant qu'un backtest positif après frais, sur une validation jamais utilisée pour régler, n'existe.
+
+---
+
+## Étape 16 : la stratégie est mise à l'épreuve selon un protocole
+
+Résultats détaillés : `docs/BACKTEST.md` (section « Étape 16 »). Protocole : `docs/STRATEGIE.md`. Verdict : **aucune des 9 variantes ne réussit, le protocole s'arrête, le test final n'est pas ouvert.**
+
+### E21. Un protocole écrit et commité avant les résultats
+`docs/STRATEGIE.md` fixe les hypothèses, leurs valeurs, les blocs, les critères de réussite et la règle d'arrêt, et il a été commité et poussé (commit `11777e3`) **avant** d'écrire ou d'exécuter la moindre variante. Pourquoi : ajuster des critères après avoir vu les chiffres est la façon la plus courante de se tromper soi-même. L'historique git prouve l'ordre. Le fichier n'a pas été modifié depuis.
+
+### E22. Quatre hypothèses, une valeur chacune, 9 variantes déclarées
+Bougies de décision de 4 h (H1), carence de 24 h (H2), stops à 2,5 × ATR et 5 × ATR (H3), filtre de régime « EMA 50 au-dessus de l'EMA 200 sur BTC » (H4). **Aucun balayage de paramètres** : chaque valeur est un choix a priori, pour ne pas fabriquer un bon résultat par sur-ajustement. Le nombre de variantes (9) est déclaré d'avance : plus on en essaie, plus l'une réussit par hasard. Précisions de conception : en 4 h, seules les décisions changent, l'exécution, les stops et la valorisation restent à l'heure (un stop contrôlé sur 4 h serait moins fidèle) ; une bougie de 4 h n'est visible qu'une fois ses quatre heures écoulées (testé) ; les ventes ne sont jamais filtrées par le régime ; en cas de doute sur le régime (données absentes), on n'achète pas. Si H3 avait été retenue, l'API n'aurait pas pu l'appliquer telle quelle (ses stops sont des pourcentages fixes par utilisateur) : il aurait fallu qu'un signal porte son niveau de stop. La question ne se pose plus.
+
+### E23. Mémoïsation des analyses du scanner, et son écart mesuré
+Le scanner recalculait, à chaque cycle, les indicateurs de la bougie courante et des deux précédentes, alors qu'une bougie fermée donne toujours le même résultat et que le moteur tourne chaque minute. Il mémorise maintenant l'analyse de chaque bougie (8 par symbole). La clé comprend le **contenu** de la bougie (horodatage, clôture, plus haut, plus bas), pas seulement son horodatage : une série qui changerait sous le même horodatage ne peut pas servir une réponse périmée (testé avec deux séries de même longueur et de sens opposé). Gains : la production ne recalcule plus rien dans l'heure, et le backtest va environ trois fois plus vite.
+**Écart mesuré avec l'étape 14 :** 2 590 signaux au lieu de 2 589 sur la fenêtre de l'étape 14, pour un rendement et un nombre d'opérations identiques (−19,83 %, 825). Cause : avant, les deux bougies précédentes étaient recalculées avec une fenêtre raccourcie d'une ou deux bougies, ce qui change très légèrement les moyennes mobiles ; maintenant, chaque bougie garde l'analyse faite quand elle était la dernière, avec la fenêtre complète. **Vérifié en désactivant le cache : on retrouve exactement 2 589.** Le comportement est plus cohérent (une bougie donne la même décision quand on la relit), et les neuf variantes partagent le même scanner.
+
+### E24. Le test final est protégé par du code, pas seulement par ma discipline
+`app/backtest/study.py` ne simule jamais le test final dans son exécution normale. `--final VARIANTE` exige que la variante soit **la variante sélectionnée** par l'étude, refuse s'il n'y en a aucune, et refuse un second essai tant que `data/final-test.json` existe. Tests unitaires pour chaque refus. Résultat ici : aucune variante n'a été sélectionnée, le test final n'a donc jamais été ouvert.
+
+### E25. Résultat : aucune variante retenue, et un diagnostic cohérent
+Le facteur de profit est sous 1,1 dans les 18 cases (apprentissage et validation des 9 variantes), le meilleur étant 1,01. La stratégie de base perd 13,2 % sur 26 mois dans un marché qui montait (détention à même exposition : +16,2 %), les frais seuls représentant 16 % du capital. Trader moins (bougies de 4 h) fait perdre moins mais ne fait pas gagner. Les stops à l'ATR aggravent. Le filtre de régime réduit le risque sans créer d'avantage. **Un seul chiffre positif sur dix-huit (V7, +0,68 % en apprentissage)**, avec un facteur de profit de 1,01 et une perte maximale de 15,4 % qui manque le critère (b) ; il ne justifie rien.
+
+### E26. Décision : on s'arrête, on ne règle pas davantage
+La règle 4 du protocole s'applique : pas de test final, pas de variante supplémentaire. Poursuivre l'ajustement de cette famille de stratégies reviendrait à chercher un faux positif. Le bloc de test final reste vierge : il pourra servir à une **nouvelle famille** de stratégies, sous un nouveau protocole écrit avant ses résultats.
+
+### E27. Limites
+Voir `docs/BACKTEST.md` : biais des survivants, une fenêtre de 36 mois, achat seul, glissement fixe. Elles affaiblissent un résultat positif ; elles ne changent pas un résultat négatif aussi uniforme.
