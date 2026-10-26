@@ -16,11 +16,14 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from app.backtest.history import HOUR_MS
 from app.backtest.metrics import Metrics, compute_metrics
 from app.backtest.portfolio import Portfolio, Trade
 from app.market import Candles
 from app.scanner import Scanner, ScanSettings
 from app.signals import SignalPublisher
+
+TIMEFRAME_HOURS = {"1h": 1, "4h": 4}
 
 
 @dataclass(frozen=True)
@@ -32,11 +35,22 @@ class BacktestConfig:
     max_exposure_pct: float = 5.0
     stop_loss_pct: float = 3.0
     take_profit_pct: float = 6.0
-    #: Réglages du moteur (valeurs de production).
+    #: Réglages du moteur (valeurs de production). Bougies de décision : « 1h » ou « 4h » ; les
+    #: ordres, les stops et la valorisation restent à l'heure dans tous les cas.
     timeframe: str = "1h"
     candles_limit: int = 200
     emit_min_score: float = 0.6
     confirm_candles: int = 3
+    #: Options du scanner, désactivées par défaut (voir `app/scanner.py`).
+    cooldown_seconds: int = 0
+    regime_filter: bool = False
+    #: Stops en multiples de l'ATR (voir `Portfolio`) ; `None` : pourcentages fixes.
+    atr_stop_multiple: float | None = None
+    atr_take_profit_multiple: float | None = None
+
+    @property
+    def hours_per_candle(self) -> int:
+        return TIMEFRAME_HOURS[self.timeframe]
 
 
 class MemoryState:
@@ -65,22 +79,73 @@ class CollectingStream:
         return f"{len(self.signals)}-0"
 
 
-class SimMarket:
-    """Marché rejoué : à l'instant `index`, seules les bougies d'indice <= `index` existent."""
+def resample(frame: pd.DataFrame, hours: int) -> pd.DataFrame:
+    """Bougies de `hours` heures bâties sur des bougies d'1 h, alignées sur les heures UTC.
 
-    def __init__(self, frames: dict[str, pd.DataFrame]) -> None:
+    Pour 4 h : groupes 00-04, 04-08, 08-12…
+
+    Un groupe incomplet (début d'historique, trou) est écarté : une bougie de 4 h bâtie sur 3 heures
+    serait fausse. `open_ms` est l'ouverture du groupe.
+    """
+    period = hours * HOUR_MS
+    grouped = frame.groupby(frame["open_ms"] // period)
+    out = grouped.agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+        count=("open_ms", "count"),
+        first=("open_ms", "min"),
+        last=("open_ms", "max"),
+    )
+    complete = (out["count"] == hours) & (out["last"] - out["first"] == (hours - 1) * HOUR_MS)
+    out = out[complete].copy()
+    out["open_ms"] = out.index.to_numpy() * period
+    return out[["open_ms", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
+
+
+class SimMarket:
+    """Marché rejoué : à l'instant `index` (une heure), seules les bougies **fermées** existent.
+
+    Avec des bougies de 4 h, une bougie de 4 h n'apparaît qu'une fois ses quatre heures écoulées : à
+    10 h, la bougie 08 h-12 h est en formation et n'est pas visible.
+    """
+
+    def __init__(self, frames: dict[str, pd.DataFrame], hours_per_candle: int = 1) -> None:
         self._frames = frames
+        self._hours = hours_per_candle
+        self._open = {s: f["open_ms"].to_numpy() for s, f in frames.items()}
+        self._close = {s: f["close"].to_numpy(dtype=float) for s, f in frames.items()}
+        self._resampled = (
+            {s: resample(f, hours_per_candle) for s, f in frames.items()}
+            if hours_per_candle > 1
+            else {}
+        )
+        self._resampled_open = {s: f["open_ms"].to_numpy() for s, f in self._resampled.items()}
         self.index = 0
 
     def universe(self, configured: list[str], limit: int) -> list[str]:
         return configured or list(self._frames)[:limit]
 
     def last_prices(self, symbols: list[str]) -> dict[str, float]:
-        return {s: float(self._frames[s]["close"].iloc[self.index]) for s in symbols}
+        return {s: float(self._close[s][self.index]) for s in symbols}
 
     def candles(self, symbol: str, timeframe: str, limit: int) -> Candles:
-        frame = self._frames[symbol]
-        window = frame.iloc[max(0, self.index + 1 - limit) : self.index + 1]
+        if self._hours == 1:
+            window = self._frames[symbol].iloc[max(0, self.index + 1 - limit) : self.index + 1]
+            return Candles(frame=window, last_open_ms=int(window["open_ms"].iloc[-1]))
+        # Bougies de plusieurs heures : fermées une fois leur dernière heure (indice <= index)
+        # écoulée.
+        open_now = int(self._open[symbol][self.index])
+        closed = int(
+            np.searchsorted(
+                self._resampled_open[symbol], open_now - (self._hours - 1) * HOUR_MS, side="right"
+            )
+        )
+        if closed == 0:
+            raise ValueError(f"aucune bougie fermée pour {symbol}")
+        window = self._resampled[symbol].iloc[max(0, closed - limit) : closed]
         return Candles(frame=window, last_open_ms=int(window["open_ms"].iloc[-1]))
 
 
@@ -119,7 +184,7 @@ def run_backtest(
     indicateurs (chauffe) : rien n'est négocié dessus."""
     config = config or BacktestConfig()
     symbols = list(frames)
-    market = SimMarket(frames)
+    market = SimMarket(frames, config.hours_per_candle)
     stream = CollectingStream()
     scanner = Scanner(
         market,
@@ -131,6 +196,8 @@ def run_backtest(
             candles_limit=config.candles_limit,
             emit_min_score=config.emit_min_score,
             confirm_candles=config.confirm_candles,
+            cooldown_seconds=config.cooldown_seconds,
+            regime_filter=config.regime_filter,
         ),
     )
     portfolio = Portfolio(
@@ -140,7 +207,11 @@ def run_backtest(
         max_exposure_pct=config.max_exposure_pct,
         stop_loss_pct=config.stop_loss_pct,
         take_profit_pct=config.take_profit_pct,
+        atr_stop_multiple=config.atr_stop_multiple,
+        atr_take_profit_multiple=config.atr_take_profit_multiple,
     )
+    hours = config.hours_per_candle
+    open_hours = next(iter(frames.values()))["open_ms"].to_numpy() // HOUR_MS
     bars = {
         s: {k: f[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close")}
         for s, f in frames.items()
@@ -158,7 +229,8 @@ def run_backtest(
         for signal in pending:
             symbol = signal["symbol"]
             if signal["action"] == "BUY":
-                portfolio.buy(symbol, signal["score"], opens[symbol], i, opens)
+                atr_pct = float((signal.get("indicators") or {}).get("atr_pct") or 0.0)
+                portfolio.buy(symbol, signal["score"], opens[symbol], i, opens, atr_pct)
             elif signal["action"] == "SELL":
                 portfolio.sell_all(symbol, opens[symbol], i, "SELL")
         pending = []
@@ -172,7 +244,10 @@ def run_backtest(
         value = portfolio.equity(closes)
         equity.append(value)
         exposure.append(portfolio.invested(closes) / value)
-        if i < end - 1:
+        # On décide quand une bougie de décision vient de se fermer (toutes les heures en 1 h, à
+        # 03 h, 07 h, 11 h… en 4 h) ; entre deux, le marché visible ne change pas.
+        decision_closed = hours == 1 or int(open_hours[i]) % hours == hours - 1
+        if i < end - 1 and decision_closed:
             market.index = i
             stream.signals.clear()
             scanner.run_once()

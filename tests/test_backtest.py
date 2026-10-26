@@ -10,6 +10,7 @@ from app.backtest.engine import (
     SimMarket,
     align,
     buy_and_hold_return_pct,
+    resample,
     run_backtest,
 )
 from app.backtest.metrics import compute_metrics, max_drawdown_pct
@@ -221,15 +222,17 @@ class ScriptedScanner:
     """Remplace le scanner : émet les signaux d'un scénario à des bougies précises (via la vraie
     publication)."""
 
-    scenario: dict[int, tuple[str, str, float]] = {}
+    scenario: dict[int, tuple] = {}
+    steps_called: list[int] = []
 
     def __init__(self, market, state, publisher, settings) -> None:
         self.market, self.publisher = market, publisher
 
     def run_once(self) -> None:
         step = self.market.index
+        self.steps_called.append(step)
         if step in self.scenario:
-            action, symbol, score = self.scenario[step]
+            action, symbol, score, *extra = self.scenario[step]
             self.publisher.publish(
                 Signal(
                     id=f"{symbol}-1h-{step}-{action}",
@@ -237,6 +240,7 @@ class ScriptedScanner:
                     symbol=symbol,
                     action=action,
                     score=score,
+                    indicators=extra[0] if extra else None,
                 )
             )
 
@@ -310,3 +314,234 @@ def test_achat_conservation_de_reference_frais_compris() -> None:
     config = BacktestConfig(fee_rate=0.001, slippage_rate=0.0005)
     expected = (150 * 0.9995 * 0.999) / (100 * 1.0005 * 1.001) - 1
     assert buy_and_hold_return_pct(bars, 0, 2, config) == pytest.approx(expected * 100)
+
+
+# ── Stops proportionnels à la volatilité (ATR) ───────────────────────────────────────────────
+
+
+def atr_portfolio(**over) -> Portfolio:
+    return Portfolio(
+        cash=10_000.0,
+        fee_rate=0,
+        slippage_rate=0,
+        atr_stop_multiple=2.5,
+        atr_take_profit_multiple=5.0,
+        **over,
+    )
+
+
+def test_stops_en_multiples_de_l_atr_fixes_a_l_entree() -> None:
+    pf = atr_portfolio()
+    pf.buy("BTC", 1.0, 100.0, 0, {"BTC": 100.0}, atr_pct=2.0)
+    position = pf.positions["BTC"]
+    assert position.stop_loss == pytest.approx(100.0 * (1 - 0.05))  # 2,5 × 2 %
+    assert position.take_profit == pytest.approx(100.0 * (1 + 0.10))  # 5 × 2 %
+
+
+def test_une_volatilite_plus_forte_donne_des_stops_plus_larges() -> None:
+    calm, wild = atr_portfolio(), atr_portfolio()
+    calm.buy("BTC", 1.0, 100.0, 0, {"BTC": 100.0}, atr_pct=0.5)
+    wild.buy("BTC", 1.0, 100.0, 0, {"BTC": 100.0}, atr_pct=3.0)
+    assert wild.positions["BTC"].stop_loss < calm.positions["BTC"].stop_loss
+
+
+def test_sans_atr_dans_le_signal_on_retombe_sur_les_pourcentages_fixes() -> None:
+    pf = atr_portfolio()
+    pf.buy("BTC", 1.0, 100.0, 0, {"BTC": 100.0}, atr_pct=0.0)
+    assert pf.positions["BTC"].stop_loss == pytest.approx(97.0)
+    assert pf.positions["BTC"].take_profit == pytest.approx(106.0)
+
+
+def test_sans_multiples_configures_l_atr_est_ignore() -> None:
+    pf = frictionless()
+    pf.buy("BTC", 1.0, 100.0, 0, {"BTC": 100.0}, atr_pct=2.0)
+    assert pf.positions["BTC"].stop_loss == pytest.approx(97.0)
+
+
+def test_un_stop_ne_passe_jamais_sous_zero() -> None:
+    pf = atr_portfolio()
+    pf.buy("BTC", 1.0, 100.0, 0, {"BTC": 100.0}, atr_pct=80.0)  # 2,5 × 80 % = 200 %
+    assert pf.positions["BTC"].stop_loss == pytest.approx(10.0)  # plafonné à -90 %
+
+
+def test_le_moteur_transmet_l_atr_du_signal_au_portefeuille(monkeypatch) -> None:
+    n = 200
+    frame = ohlc(np.full(n, 100.0))  # ouverture 100, mèches de 0,1 %
+    # Après l'entrée (ouverture de la bougie 101) : une mèche à 96 puis une mèche à 94.
+    frame.loc[102, "low"] = 96.0  # un stop fixe à 3 % (97) aurait déjà sorti
+    frame.loc[104, "low"] = 94.0  # le stop à 2,5 × 2 % = 5 % (95) est atteint ici
+    monkeypatch.setattr(engine_module, "Scanner", ScriptedScanner)
+    ScriptedScanner.scenario = {100: ("BUY", "BTC", 1.0, {"atr_pct": 2.0})}
+    config = BacktestConfig(
+        fee_rate=0, slippage_rate=0, atr_stop_multiple=2.5, atr_take_profit_multiple=5.0
+    )
+
+    result = run_backtest({"BTC": frame}, 70, 190, config)
+
+    [trade] = result.trades
+    assert (trade.reason, trade.exit_index) == ("STOP_LOSS", 104)
+    assert trade.exit_price == pytest.approx(100.0 * 0.95)
+
+    # Sans les multiples, le stop fixe de 3 % sort dès la bougie 102.
+    fixed = run_backtest({"BTC": frame}, 70, 190, BacktestConfig(fee_rate=0, slippage_rate=0))
+    assert fixed.trades[0].exit_index == 102
+
+
+# ── Bougies de 4 h ───────────────────────────────────────────────────────────────────────────
+
+FOUR_HOURS = 4 * HOUR_MS
+T4 = (T0 // FOUR_HOURS) * FOUR_HOURS  # début d'une bougie de 4 h
+
+
+def test_resample_agrege_les_quatre_heures_sans_inventer_de_bougie() -> None:
+    # Commence à 01 h : le premier groupe (01-04 h) est incomplet et doit disparaître.
+    base = ohlc(np.arange(100.0, 111.0), t0=T4 + HOUR_MS)  # 11 bougies : 01 h … 11 h
+    out = resample(base, 4)
+
+    # Heures 01 à 11 : le groupe 00-04 h n'a que 3 bougies (écarté) ; 04-08 h et 08-12 h sont
+    # complets.
+    assert list(out["open_ms"]) == [T4 + FOUR_HOURS, T4 + 2 * FOUR_HOURS]
+    first = base.iloc[3:7]
+    row = out.iloc[0]
+    assert (row["open"], row["close"]) == (first["open"].iloc[0], first["close"].iloc[-1])
+    assert row["high"] == first["high"].max() and row["low"] == first["low"].min()
+    assert row["volume"] == first["volume"].sum()
+
+
+def test_resample_ecarte_un_groupe_troue() -> None:
+    base = ohlc(np.arange(100.0, 116.0), t0=T4)  # 16 bougies : 4 groupes complets
+    holed = base.drop(index=[5]).reset_index(drop=True)  # il manque une heure dans le 2e groupe
+    out = resample(holed, 4)
+    assert list(out["open_ms"]) == [T4, T4 + 2 * FOUR_HOURS, T4 + 3 * FOUR_HOURS]
+
+
+def test_le_marche_4h_ne_montre_la_bougie_qu_apres_ses_quatre_heures() -> None:
+    market = SimMarket({"BTC": ohlc(np.arange(1.0, 41.0), t0=T4)}, hours_per_candle=4)
+
+    market.index = 2  # 02 h : aucune bougie de 4 h n'est encore fermée
+    with pytest.raises(ValueError):
+        market.candles("BTC", "4h", 50)
+
+    market.index = 3  # 03 h se termine à 04 h : la première bougie est fermée
+    first = market.candles("BTC", "4h", 50)
+    assert (len(first.frame), first.last_open_ms) == (1, T4)
+    assert first.frame["close"].iloc[-1] == 4.0  # clôture de l'heure 03 (valeur 4)
+
+    market.index = 10  # 10 h : la bougie 08-12 h est en formation, invisible
+    mid = market.candles("BTC", "4h", 50)
+    assert mid.last_open_ms == T4 + FOUR_HOURS  # dernière fermée : 04-08 h
+    assert mid.frame["close"].iloc[-1] == 8.0  # clôture de l'heure 07
+
+    market.index = 11  # 11 h : la bougie 08-12 h vient de se fermer
+    done = market.candles("BTC", "4h", 50)
+    assert done.last_open_ms == T4 + 2 * FOUR_HOURS
+    assert done.frame["close"].iloc[-1] == 12.0
+    # Le prix « du moment » reste celui de l'heure courante, pas celui d'une bougie de 4 h.
+    assert market.last_prices(["BTC"]) == {"BTC": 12.0}
+
+
+def test_le_marche_4h_respecte_la_limite_de_bougies() -> None:
+    market = SimMarket({"BTC": ohlc(np.arange(1.0, 101.0), t0=T4)}, hours_per_candle=4)
+    market.index = 99
+    assert len(market.candles("BTC", "4h", 10).frame) == 10
+
+
+def test_le_scanner_ne_tourne_que_lorsqu_une_bougie_de_decision_se_ferme(monkeypatch) -> None:
+    frame = ohlc(np.linspace(100, 200, 400), t0=T4)
+    monkeypatch.setattr(engine_module, "Scanner", ScriptedScanner)
+    ScriptedScanner.scenario = {}
+    ScriptedScanner.steps_called = []
+
+    run_backtest({"BTC": frame}, 100, 200, BacktestConfig(timeframe="4h"))
+
+    steps = ScriptedScanner.steps_called
+    assert steps and all(step % 4 == 3 for step in steps)  # 03 h, 07 h, 11 h… (T4 aligné)
+    assert steps == [i for i in range(100, 199) if i % 4 == 3]  # et la dernière bougie jamais
+
+
+def test_en_1h_le_scanner_tourne_a_chaque_bougie(monkeypatch) -> None:
+    monkeypatch.setattr(engine_module, "Scanner", ScriptedScanner)
+    ScriptedScanner.scenario = {}
+    ScriptedScanner.steps_called = []
+    run_backtest({"BTC": ohlc(np.linspace(100, 200, 300))}, 100, 150)
+    assert ScriptedScanner.steps_called == list(range(100, 149))
+
+
+def test_le_decalage_d_execution_en_4h_reste_a_l_heure(monkeypatch) -> None:
+    """Décision à la clôture d'une bougie de 4 h (indice 107), exécution à l'heure suivante."""
+    frame = ohlc(np.linspace(100, 200, 300), t0=T4)
+    monkeypatch.setattr(engine_module, "Scanner", ScriptedScanner)
+    ScriptedScanner.scenario = {107: ("BUY", "BTC", 1.0), 115: ("SELL", "BTC", 1.0)}
+    ScriptedScanner.steps_called = []
+
+    result = run_backtest({"BTC": frame}, 100, 250, BacktestConfig(timeframe="4h", slippage_rate=0))
+
+    [trade] = result.trades
+    assert (trade.entry_index, trade.exit_index) == (108, 116)
+    assert trade.entry_price == pytest.approx(frame["open"][108])
+
+
+def real_frames(n: int, symbols=("BTC", "AAA", "BBB")) -> dict[str, pd.DataFrame]:
+    return {
+        s: ohlc(walk(0.0008, n, seed=seed), t0=T4)
+        for s, seed in zip(symbols, (1, 2, 3), strict=False)
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"timeframe": "4h"},
+        {"regime_filter": True},
+        {"cooldown_seconds": 24 * 3600},
+        {"atr_stop_multiple": 2.5, "atr_take_profit_multiple": 5.0},
+        {
+            "timeframe": "4h",
+            "regime_filter": True,
+            "atr_stop_multiple": 2.5,
+            "atr_take_profit_multiple": 5.0,
+        },
+    ],
+)
+def test_pas_de_regard_sur_le_futur_pour_chaque_option(overrides) -> None:
+    """Réécrire l'avenir (krach de 80 % après la bougie k) ne change rien à ce qui précède."""
+    n, k = 900, 780
+    frames = real_frames(n)
+    altered = {}
+    for symbol, frame in frames.items():
+        changed = frame.copy()
+        for col in ("open", "high", "low", "close"):
+            changed.loc[k + 1 :, col] = changed.loc[k + 1 :, col] * 0.2
+        altered[symbol] = changed
+    config = BacktestConfig(**overrides)
+
+    normal = run_backtest(frames, 700, n, config)
+    other = run_backtest(altered, 700, n, config)
+
+    steps = k - 700 + 1
+    assert normal.equity[:steps] == pytest.approx(other.equity[:steps])
+    before = lambda r: [t for t in r.trades if t.exit_index <= k]  # noqa: E731
+    assert before(normal) == before(other)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"timeframe": "4h"}, {"regime_filter": True}, {"cooldown_seconds": 86_400}],
+)
+def test_les_options_changent_reellement_le_comportement(overrides) -> None:
+    """Garde-fou contre une option branchée sur rien : elle doit produire un résultat différent."""
+    frames = real_frames(1500)
+    base = run_backtest(frames, 800, 1500)
+    variant = run_backtest(frames, 800, 1500, BacktestConfig(**overrides))
+    assert base.metrics.trades > 0
+    assert (variant.equity != base.equity) or (variant.trades != base.trades)
+
+
+def test_les_options_par_defaut_ne_changent_pas_le_resultat() -> None:
+    frames = real_frames(1000)
+    assert (
+        run_backtest(frames, 700, 1000).equity
+        == run_backtest(
+            frames, 700, 1000, BacktestConfig(cooldown_seconds=0, regime_filter=False)
+        ).equity
+    )

@@ -6,10 +6,20 @@ import pandas as pd
 from app.indicators import Indicators
 from app.market import Candles
 
+FRAME_T0 = 1_793_000_000_000
+
 
 def frame(closes: list[float] | np.ndarray) -> pd.DataFrame:
+    """Bougies d'1 h à partir de prix de clôture (mèches de 0,1 %), avec horodatage."""
     closes = np.asarray(closes, dtype=float)
-    return pd.DataFrame({"close": closes, "high": closes * 1.001, "low": closes * 0.999})
+    return pd.DataFrame(
+        {
+            "open_ms": FRAME_T0 + np.arange(len(closes)) * 3_600_000,
+            "close": closes,
+            "high": closes * 1.001,
+            "low": closes * 0.999,
+        }
+    )
 
 
 def walk(drift: float, n: int = 120, sigma: float = 0.008, seed: int = 2) -> np.ndarray:
@@ -107,6 +117,8 @@ class FakeMarket:
         self.series = series
         self.prices = prices or {}
         self.universe_calls: list[tuple[list[str], int]] = []
+        #: Si défini : ouverture (ms) de la dernière bougie annoncée (sinon déduite de la longueur).
+        self.clock_ms: int | None = None
 
     def universe(self, configured: list[str], limit: int) -> list[str]:
         self.universe_calls.append((configured, limit))
@@ -119,4 +131,5 @@ class FakeMarket:
         data = self.series[symbol]
         if isinstance(data, Exception):
             raise data
-        return Candles(frame=frame(data), last_open_ms=1_793_000_000_000 + len(data) * 3_600_000)
+        last_open = self.clock_ms or 1_793_000_000_000 + len(data) * 3_600_000
+        return Candles(frame=frame(data), last_open_ms=last_open)

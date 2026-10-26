@@ -71,3 +71,7 @@ Pas de backtest : la stratégie n'a pas été éprouvée sur l'historique (E12).
 ## Backtest
 
 `uv run python -m app.backtest` rejoue la stratégie sur 12 mois d'historique Binance public (périodes d'optimisation et de validation séparées). Résultats et mode d'emploi détaillé : `docs/BACKTEST.md`. **À lire avant tout passage en LIVE** : la stratégie actuelle y perd de l'argent.
+
+### Étude de la stratégie (étape 16)
+
+`uv run python -m app.backtest.study` applique le protocole de `docs/STRATEGIE.md` (9 variantes, apprentissage et validation, critères évalués par le code). Il n'ouvre jamais le test final ; `--final VARIANTE` ne l'accepte que pour la variante sélectionnée, une seule fois. **Verdict actuel : aucune variante ne réussit** (`docs/BACKTEST.md`). Avec 4 processeurs, l'étude complète prend une vingtaine de minutes. Le scanner accepte deux options, désactivées par défaut : `cooldown_seconds` (carence entre deux signaux) et `regime_filter` (pas d'achat si BTC n'est pas en tendance haussière).

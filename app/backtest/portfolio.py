@@ -49,6 +49,10 @@ class Portfolio:
     max_exposure_pct: float = 5.0
     stop_loss_pct: float = 3.0
     take_profit_pct: float = 6.0
+    #: Si les deux sont définis, les stops sont des multiples de l'ATR (en % du prix) donné par le
+    #: signal, fixés à l'entrée ; sans ATR dans le signal, on retombe sur les pourcentages fixes.
+    atr_stop_multiple: float | None = None
+    atr_take_profit_multiple: float | None = None
     positions: dict[str, Position] = field(default_factory=dict)
     trades: list[Trade] = field(default_factory=list)
     fees_paid: float = 0.0
@@ -60,7 +64,13 @@ class Portfolio:
         return sum(p.quantity * prices[s] for s, p in self.positions.items())
 
     def buy(
-        self, symbol: str, score: float, price: float, index: int, prices: dict[str, float]
+        self,
+        symbol: str,
+        score: float,
+        price: float,
+        index: int,
+        prices: dict[str, float],
+        atr_pct: float = 0.0,
     ) -> bool:
         """Achat dimensionné comme l'API : la place restante sous le plafond d'exposition,
         proportionnelle au score."""
@@ -80,6 +90,7 @@ class Portfolio:
         self.cash -= spend + fee
         self.fees_paid += fee
 
+        stop_pct, take_pct = self._stop_distances(atr_pct)
         previous = self.positions.get(symbol)
         total = quantity + (previous.quantity if previous else 0.0)
         avg = (
@@ -89,11 +100,20 @@ class Portfolio:
             quantity=total,
             avg_price=avg,
             entry_index=previous.entry_index if previous else index,
-            stop_loss=avg * (1 - self.stop_loss_pct / 100),
-            take_profit=avg * (1 + self.take_profit_pct / 100),
+            stop_loss=avg * (1 - stop_pct / 100),
+            take_profit=avg * (1 + take_pct / 100),
             entry_fees=(previous.entry_fees if previous else 0.0) + fee,
         )
         return True
+
+    def _stop_distances(self, atr_pct: float) -> tuple[float, float]:
+        """Distances du stop-loss et du take-profit, en % du prix d'entrée."""
+        if self.atr_stop_multiple and self.atr_take_profit_multiple and atr_pct > 0:
+            return (
+                min(atr_pct * self.atr_stop_multiple, 90.0),  # un stop ne passe jamais sous zéro
+                atr_pct * self.atr_take_profit_multiple,
+            )
+        return self.stop_loss_pct, self.take_profit_pct
 
     def sell_all(self, symbol: str, price: float, index: int, reason: str) -> bool:
         """Vend toute la position, au prix `price` dégradé par le glissement, frais déduits."""

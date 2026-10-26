@@ -2,9 +2,18 @@ import json
 
 import numpy as np
 
+import app.scanner as scanner_module
 from app.scanner import STANCE_KEY, Scanner, ScanSettings
 from app.signals import SignalPublisher
-from tests.helpers import BUY_SERIES, FIRST_BUY, SELL_SERIES, FakeMarket, FakeState, FakeStream
+from tests.helpers import (
+    BUY_SERIES,
+    FIRST_BUY,
+    SELL_SERIES,
+    FakeMarket,
+    FakeState,
+    FakeStream,
+    walk,
+)
 
 # Séries où la stratégie décide réellement BUY / SELL (voir tests/helpers.py).
 UP = BUY_SERIES[:-1]
@@ -185,3 +194,191 @@ def test_changement_non_confirme_conserve_la_position_precedente() -> None:
     market.series["BTC"] = UP  # confirmé sur 3 bougies
     scanner.run_once()
     assert [s["action"] for s in published(stream)] == ["BUY"]
+
+
+# ── Mémoïsation des analyses ─────────────────────────────────────────────────────────────────
+
+
+def count_indicator_computations(monkeypatch) -> list[int]:
+    calls = [0]
+    real = scanner_module.compute_indicators
+
+    def counting(frame):
+        calls[0] += 1
+        return real(frame)
+
+    monkeypatch.setattr(scanner_module, "compute_indicators", counting)
+    return calls
+
+
+def test_une_bougie_deja_analysee_n_est_jamais_recalculee(monkeypatch) -> None:
+    calls = count_indicator_computations(monkeypatch)
+    scanner, market, _, _ = build({"BTC": UP, "ETH": DOWN})
+
+    scanner.run_once()
+    first = calls[0]
+    assert first == 2 * 3  # 2 symboles × 3 bougies de confirmation
+
+    scanner.run_once()  # le moteur tourne chaque minute : rien n'a changé, rien à recalculer
+    assert calls[0] == first
+
+    market.series["BTC"] = UP_NEXT_CANDLE  # une nouvelle bougie pour BTC seulement
+    scanner.run_once()
+    assert calls[0] == first + 1  # seule la nouvelle bougie est calculée
+
+
+def test_une_serie_qui_change_sous_le_meme_horodatage_ne_sert_jamais_une_reponse_perimee(
+    monkeypatch,
+) -> None:
+    # Même longueur, donc mêmes horodatages ; contenu opposé. Un cache indexé par l'horodatage seul
+    # répondrait « BUY » à une série baissière.
+    up, down = walk(0.002, 150, seed=7), walk(-0.002, 150, seed=7)
+    calls = count_indicator_computations(monkeypatch)
+    scanner, market, state, stream = build({"AAA": up}, emit_on_first_scan=True)
+    scanner.run_once()
+    before = calls[0]
+
+    market.series["AAA"] = down
+    scanner.run_once()
+
+    assert calls[0] == before + 3  # tout est recalculé : le contenu a changé
+    assert state.hashes[STANCE_KEY]["AAA"] != "BUY"
+
+
+def test_la_memoire_est_bornee_par_symbole() -> None:
+    scanner, market, _, _ = build({"BTC": walk(0.001, 400, seed=3)})
+    for n in range(100, 400):
+        market.series["BTC"] = walk(0.001, 400, seed=3)[:n]
+        scanner.run_once()
+    assert len(scanner._cache["BTC"]) <= scanner_module.CACHE_PER_SYMBOL
+
+
+# ── Délai de carence ─────────────────────────────────────────────────────────────────────────
+
+HOUR_MS = 3_600_000
+T = 1_793_100_000_000
+
+
+def test_delai_de_carence_retient_un_signal_trop_proche_puis_le_publie() -> None:
+    scanner, market, state, stream = build(
+        {"AAA": FLAT}, cooldown_seconds=24 * 3600, emit_on_first_scan=False
+    )
+    market.clock_ms = T
+    scanner.run_once()  # baseline HOLD
+
+    market.series["AAA"] = UP
+    market.clock_ms = T + HOUR_MS
+    scanner.run_once()
+    assert [s["action"] for s in published(stream)] == ["BUY"]
+
+    market.series["AAA"] = DOWN  # la vente arrive 2 h plus tard : trop tôt
+    market.clock_ms = T + 3 * HOUR_MS
+    scanner.run_once()
+    assert [s["action"] for s in published(stream)] == ["BUY"]
+    assert state.hashes[STANCE_KEY]["AAA"] == "BUY"  # le changement n'est pas « consommé »
+
+    market.clock_ms = T + 25 * HOUR_MS  # 24 h après le premier signal : la vente part
+    scanner.run_once()
+    assert [s["action"] for s in published(stream)] == ["BUY", "SELL"]
+
+
+def test_sans_delai_de_carence_la_vente_part_tout_de_suite() -> None:
+    scanner, market, _, stream = build({"AAA": FLAT})
+    market.clock_ms = T
+    scanner.run_once()
+    market.series["AAA"] = UP
+    market.clock_ms = T + HOUR_MS
+    scanner.run_once()
+    market.series["AAA"] = DOWN
+    market.clock_ms = T + 3 * HOUR_MS
+    scanner.run_once()
+    assert [s["action"] for s in published(stream)] == ["BUY", "SELL"]
+
+
+def test_le_delai_de_carence_est_par_symbole() -> None:
+    scanner, market, _, stream = build({"AAA": FLAT, "BBB": FLAT}, cooldown_seconds=24 * 3600)
+    market.clock_ms = T
+    scanner.run_once()
+    market.series["AAA"] = UP
+    market.clock_ms = T + HOUR_MS
+    scanner.run_once()
+    market.series["BBB"] = UP  # AAA a signalé il y a 1 h : BBB n'est pas concerné
+    market.clock_ms = T + 2 * HOUR_MS
+    scanner.run_once()
+    assert sorted(s["symbol"] for s in published(stream)) == ["AAA", "BBB"]
+
+
+def test_le_delai_de_carence_survit_a_un_redemarrage() -> None:
+    market = FakeMarket({"AAA": FLAT})
+    state, stream = FakeState(), FakeStream()
+    settings = ScanSettings(cooldown_seconds=24 * 3600)
+
+    def new_scanner():
+        return Scanner(market, state, SignalPublisher(stream, "signals", 10_000), settings)
+
+    market.clock_ms = T
+    new_scanner().run_once()
+    market.series["AAA"] = UP
+    market.clock_ms = T + HOUR_MS
+    new_scanner().run_once()
+    market.series["AAA"] = DOWN
+    market.clock_ms = T + 2 * HOUR_MS
+    new_scanner().run_once()  # nouveau processus : l'état de carence est dans Redis
+    assert [s["action"] for s in published(stream)] == ["BUY"]
+
+
+# ── Filtre de régime ─────────────────────────────────────────────────────────────────────────
+
+BULL_MARKET = np.linspace(100, 300, 400)
+BEAR_MARKET = np.linspace(300, 100, 400)
+
+
+def test_filtre_de_regime_bloque_les_achats_quand_btc_est_baissier() -> None:
+    scanner, _, state, stream = build(
+        {"BTC": BEAR_MARKET, "AAA": UP}, regime_filter=True, emit_on_first_scan=True
+    )
+    scanner.run_once()
+    assert [s for s in published(stream) if s["action"] == "BUY"] == []
+    assert state.hashes[STANCE_KEY]["AAA"] == "HOLD"  # le BUY est traité comme « ne rien faire »
+
+
+def test_filtre_de_regime_laisse_passer_les_achats_quand_btc_est_haussier() -> None:
+    scanner, _, _, stream = build(
+        {"BTC": BULL_MARKET, "AAA": UP}, regime_filter=True, emit_on_first_scan=True
+    )
+    scanner.run_once()
+    assert [s["symbol"] for s in published(stream) if s["action"] == "BUY"] == ["AAA"]
+
+
+def test_filtre_de_regime_ne_bloque_jamais_les_ventes() -> None:
+    scanner, _, _, stream = build(
+        {"BTC": BEAR_MARKET, "AAA": DOWN}, regime_filter=True, emit_on_first_scan=True
+    )
+    scanner.run_once()
+    assert [s["symbol"] for s in published(stream) if s["action"] == "SELL"] == ["AAA"]
+
+
+def test_sans_filtre_de_regime_btc_baissier_ne_change_rien() -> None:
+    scanner, _, _, stream = build({"BTC": BEAR_MARKET, "AAA": UP}, emit_on_first_scan=True)
+    scanner.run_once()
+    assert [s["symbol"] for s in published(stream) if s["action"] == "BUY"] == ["AAA"]
+
+
+def test_filtre_de_regime_en_cas_de_doute_on_n_achete_pas() -> None:
+    # Pas assez de bougies pour juger le régime : échec « fermé », et l'erreur est visible.
+    scanner, _, _, stream = build(
+        {"BTC": np.linspace(100, 300, 150), "AAA": UP}, regime_filter=True, emit_on_first_scan=True
+    )
+    report = scanner.run_once()
+    assert "regime" in report.errors
+    assert [s for s in published(stream) if s["action"] == "BUY"] == []
+
+
+def test_un_achat_bloque_par_le_regime_part_quand_le_regime_redevient_haussier() -> None:
+    scanner, market, _, stream = build({"BTC": BEAR_MARKET, "AAA": UP}, regime_filter=True)
+    scanner.run_once()  # baseline : AAA est « HOLD » (achat bloqué)
+    assert published(stream) == []
+
+    market.series["BTC"] = BULL_MARKET  # le marché d'ensemble se retourne
+    scanner.run_once()
+    assert [s["symbol"] for s in published(stream) if s["action"] == "BUY"] == ["AAA"]

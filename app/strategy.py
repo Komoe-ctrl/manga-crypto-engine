@@ -113,6 +113,7 @@ def _mirror(ind: Indicators) -> Indicators:
         bb_pct=1.0 - ind.bb_pct,
         volatility_pct=ind.volatility_pct,
         recent_cross={"UP": "DOWN", "DOWN": "UP"}.get(ind.recent_cross or ""),
+        atr_pct=ind.atr_pct,
     )
 
 
