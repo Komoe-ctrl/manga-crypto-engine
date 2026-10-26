@@ -15,3 +15,6 @@ wheels/
 # Outils
 .pytest_cache/
 .ruff_cache/
+
+# Historique de bougies téléchargé par le backtest (reproductible, volumineux)
+data/
